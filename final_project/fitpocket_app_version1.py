@@ -1,6 +1,6 @@
 import random
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Set
 
 import pandas as pd
 import streamlit as st
@@ -269,213 +269,337 @@ DailyMenu = Dict[str, Any]
 Plan = Dict[str, Any]
 Combo = Dict[str, Any]
 
+# Display labels for meal sections
+MEAL_DISPLAY_NAMES = {
+    "breakfast": "早餐時光",
+    "lunch": "午間補給",
+    "dinner": "晚餐饗宴",
+}
+
 # ---------------------------------------------------------------------
-# 1) 資料載入：從 CSV 讀取 7-ELEVEN 食品清單
+# 1) 資料載入與全域設定
 # ---------------------------------------------------------------------
 DATA_PATH = Path(__file__).parent / "711_food_data.csv"
 
+CONSTANTS = {
+    "BUDGET_TOLERANCE": 50,
+    "SIMULATION_COUNT": 20000,
+    "TARGET_Categories": 6,
+    "MAX_BUDGET_OVERRUN": 100,  # 最多只接受超出預算 100 元內的方案
+    "CALORIE_RANGE": (0.9, 1.1),  # 總熱量需落在 TDEE 的 90%~110%
+    "CAL_DIFF_WARN_RATIO": 0.05,  # 超支保留時允許的熱量相對誤差
+}
+
+ACTIVITY_MULTIPLIERS = {
+    "久坐": 1.2,
+    "輕強度": 1.4,
+    "中強度": 1.6,
+    "高強度": 1.8,
+    "超高強度": 2.0,
+}
+
+FOOD_GROUPS = ["全穀雜糧類", "豆魚蛋肉類", "乳品類", "蔬菜類", "水果類", "油脂與堅果種子類"]
+
+
+def parse_list(val: Any) -> List[str]:
+    """將 CSV 欄位轉為乾淨的列表。"""
+    if pd.isna(val):
+        return []
+    normalized = (
+        str(val)
+        .replace('"', "")
+        .replace("，", ",")
+        .replace("、", ",")
+        .replace("/", ",")
+        .replace("／", ",")
+        .replace("|", ",")
+    )
+    return [x.strip() for x in normalized.split(",") if x.strip()]
+
 
 @st.cache_data
-def load_food_df() -> pd.DataFrame:
-    """讀取 CSV 並進行欄位清洗與欄位標準化。"""
-    if not DATA_PATH.exists():
-        st.error(f"找不到資料檔案：{DATA_PATH}")
-        return pd.DataFrame()
+def load_and_prep_data(filepath: Path) -> tuple[pd.DataFrame, str]:
+    """依據最新防呆規則讀取並清洗 7-ELEVEN 食品資料。"""
+    if not filepath.exists():
+        return pd.DataFrame(), "錯誤：找不到檔案，請確認檔名是否正確。"
 
     try:
-        df = pd.read_csv(DATA_PATH, encoding="utf-8")
+        df = pd.read_csv(filepath, encoding="utf-8")
     except UnicodeDecodeError:
-        df = pd.read_csv(DATA_PATH, encoding="utf-8-sig")
-    if "食物名稱(name)" not in df.columns:
-        st.error("CSV 欄位名稱不符合預期，請確認檔案格式。")
-        return pd.DataFrame()
+        df = pd.read_csv(filepath, encoding="utf-8-sig")
+    except FileNotFoundError:
+        return pd.DataFrame(), "錯誤：找不到檔案，請確認檔名是否正確。"
 
-    df = df.dropna(subset=["食物名稱(name)"])
+    # 自動去除欄位名稱前後空白
+    df.columns = df.columns.str.strip()
 
-    def parse_list(val: Any) -> List[str]:
-        if pd.isna(val):
-            return []
-        return [x.strip() for x in str(val).replace("，", ",").split(",") if x.strip()]
+    required_cols = [
+        "價格(price)",
+        "熱量(calories)",
+        "餐次規則(meal)",
+        "餐點性質(type)",
+        "食物六大類(category)",
+        "食物名稱(name)",
+    ]
+    if not all(col in df.columns for col in required_cols):
+        return pd.DataFrame(), f"錯誤：資料庫缺漏必要欄位，請檢查 CSV 表頭是否包含: {required_cols}"
+
+    # 轉型失敗強制 NaN，以便後續清除
+    df["價格(price)"] = pd.to_numeric(df["價格(price)"], errors="coerce")
+    df["熱量(calories)"] = pd.to_numeric(df["熱量(calories)"], errors="coerce")
+
+    # 關鍵欄位不得為空
+    df = df.dropna(subset=required_cols)
+    if df.empty:
+        return pd.DataFrame(), "錯誤：資料庫中沒有有效資料 (所有資料均含有空值)。"
 
     df["meal_list"] = df["餐次規則(meal)"].apply(parse_list)
     df["category_list"] = df["食物六大類(category)"].apply(parse_list)
-    df["has_veg"] = df["category_list"].apply(lambda x: "蔬菜類" in x)
-    df["商店(shop)"] = df["商店(shop)"].fillna("7-ELEVEN")
-    df["價格(price)"] = pd.to_numeric(df["價格(price)"], errors="coerce").fillna(0).astype(int)
-    df["熱量(calories)"] = pd.to_numeric(df["熱量(calories)"], errors="coerce").fillna(0).astype(int)
+    df["categories_set"] = df["category_list"].apply(set)
 
-    img_series = df["食物無片(image)"] if "食物無片(image)" in df.columns else pd.Series([None] * len(df))
+    def normalize_type(row: pd.Series) -> str:
+        raw_type = str(row["餐點性質(type)"]).strip()
+        if raw_type in ["主餐", "主食"]:
+            return "主食"
+        return "副餐"
+
+    df["normalized_type"] = df.apply(normalize_type, axis=1)
+
+    def is_beverage(row: pd.Series) -> bool:
+        raw_type = str(row["餐點性質(type)"]).strip()
+        if raw_type == "飲料":
+            return True
+
+        name = str(row["食物名稱(name)"])
+        cat = str(row["食物六大類(category)"])
+
+        if "乳品類" in cat:
+            return True
+        keywords = ["拿鐵", "美式", "咖啡", "茶", "豆漿", "鮮奶", "牛奶", "飲", "汁"]
+        for k in keywords:
+            if k in name and "沙茶" not in name and "茶葉蛋" not in name:
+                return True
+        return False
+
+    df["is_drink"] = df.apply(is_beverage, axis=1)
+
+    # 補齊店家、圖片欄位，避免渲染錯誤
+    if "商店(shop)" in df.columns:
+        df["商店(shop)"] = df["商店(shop)"].fillna("7-ELEVEN")
+    else:
+        df["商店(shop)"] = "7-ELEVEN"
+
+    img_series = df["食物無片(image)"] if "食物無片(image)" in df.columns else pd.Series([None] * len(df), index=df.index)
     if "image" in df.columns:
         img_series = img_series.fillna(df["image"])
     df["img"] = img_series.fillna("").replace("", pd.NA)
-    return df
+
+    # 與舊版欄位名稱保持兼容
+    df["type_norm"] = df["normalized_type"]
+    return df, "OK"
 
 
-FOOD_DF = load_food_df()
-if FOOD_DF.empty:
-    st.error("找不到有效的 7-ELEVEN 食物資料，請確認 711_food_data.csv 是否存在且格式正確。")
+FOOD_DF, LOAD_STATUS = load_and_prep_data(DATA_PATH)
+if LOAD_STATUS != "OK":
+    st.error(LOAD_STATUS)
+    st.stop()
 
 
-def row_to_item(row: pd.Series) -> MealItem:
+def record_to_item(record: Dict[str, Any]) -> MealItem:
+    """將原始記錄轉為前端渲染需要的格式。"""
+    cats_val = record.get("categories_set") or set()
+    if not isinstance(cats_val, set):
+        try:
+            cats_val = set(cats_val)
+        except TypeError:
+            cats_val = set()
+    img_val = record.get("img")
+    img_val = img_val if isinstance(img_val, str) and img_val else None
     return {
-        "store": row["商店(shop)"],
-        "meal_time": row["meal_list"],
-        "name": row["食物名稱(name)"],
-        "type": row.get("餐點性質(type)", ""),
-        "price": int(row["價格(price)"]),
-        "cal": int(row["熱量(calories)"]),
-        "cats": list(row["category_list"]),
-        "img": row["img"] if isinstance(row["img"], str) and row["img"] else None,
+        "store": record.get("商店(shop)", "7-ELEVEN"),
+        "meal_time": record.get("meal_list", []),
+        "name": record.get("食物名稱(name)", ""),
+        "type": record.get("normalized_type") or record.get("type_norm", ""),
+        "price": int(record.get("價格(price)", 0)),
+        "cal": int(record.get("熱量(calories)", 0)),
+        "cats": list(cats_val),
+        "img": img_val,
+        "is_drink": bool(record.get("is_drink", False)),
     }
 
-TARGET_TIERS = [1500, 1800, 2000, 2200, 2500, 2700]
-FOOD_GROUPS = ["全穀雜糧類", "豆魚蛋肉類", "乳品類", "蔬菜類", "水果類", "油脂與堅果種子類"]
-MAIN_DISH_CAT = "全穀雜糧類"
-BUDGET_TOLERANCE = 50  # 總預算允許的浮動範圍
-DEFAULT_SIMULATIONS = 50000
 
-
-# ---------------------------------------------------------------------
-# 2) 演算法：BMR / TDEE / 菜單生成
-# ---------------------------------------------------------------------
 def calculate_bmr(gender: str, age: int, height_cm: float, weight_kg: float) -> float:
-    """依性別使用 Harris-Benedict 公式計算 BMR。"""
+    """依新版公式計算 BMR。"""
     if gender == "male":
-        return 66.5 + (13.75 * weight_kg) + (5.003 * height_cm) - (6.755 * age)
-    return 655.1 + (9.563 * weight_kg) + (1.850 * height_cm) - (4.676 * age)
+        return 5.0 * height_cm + 13.7 * weight_kg - 6.8 * age + 66
+    return 1.8 * height_cm + 9.6 * weight_kg - 4.7 * age + 655
 
 
-def get_activity_multiplier(level: str) -> float:
-    return {
-        "sedentary": 1.2,
-        "light": 1.375,
-        "moderate": 1.55,
-        "active": 1.725,
-        "very_active": 1.9,
-    }.get(level, 1.2)
+def calculate_tdee(user_profile: Dict[str, Any]) -> float:
+    """依據活動係數計算 TDEE。"""
+    bmr = calculate_bmr(
+        gender=user_profile["gender"],
+        age=user_profile["age"],
+        height_cm=user_profile["height"],
+        weight_kg=user_profile["weight"],
+    )
+    return bmr * ACTIVITY_MULTIPLIERS.get(user_profile["activity_level"], 1.2)
 
 
-def get_closest_tier(tdee: float) -> int:
-    for tier in TARGET_TIERS:
-        if tdee <= tier:
-            return tier
-    return TARGET_TIERS[-1]
+def bmi_category(bmi: float) -> str:
+    """成人 BMI 分類（台灣標準）。"""
+    if bmi < 18.5:
+        return "體重過輕"
+    if bmi < 24:
+        return "健康體位"
+    if bmi < 27:
+        return "體重過重"
+    if bmi < 30:
+        return "輕度肥胖"
+    if bmi < 35:
+        return "中度肥胖"
+    return "重度肥胖"
 
 
-class MenuOptimizer:
-    """蒙地卡羅取樣，加入餐點性質（主食/副餐）組合規則與預算容忍。"""
+def get_meal_candidates(df: pd.DataFrame, meal_tag: str) -> List[List[Dict[str, Any]]]:
+    """依主/副餐規則生成候選餐點組合。"""
+    valid_df = df[df["meal_list"].apply(lambda x: meal_tag in x)].copy()
+    if valid_df.empty:
+        return []
 
-    def __init__(self, df: pd.DataFrame):
-        self.df = df.copy()
-        if "餐點性質(type)" not in self.df.columns:
-            self.df["餐點性質(type)"] = "主食"
-        if "categories_set" not in self.df.columns:
-            self.df["categories_set"] = self.df["category_list"].apply(lambda x: set(x))
+    mains = valid_df[valid_df["normalized_type"] == "主食"].to_dict("records")
+    sides = valid_df[valid_df["normalized_type"] == "副餐"].to_dict("records")
+    candidates: List[List[Dict[str, Any]]] = []
 
-    def _parse_candidates(self, meal_type: str) -> List[List[MealItem]]:
-        """依餐次生成候選組合，遵循主/副餐規則。"""
-        valid = self.df[self.df["meal_list"].apply(lambda x: meal_type in x)]
-        mains = valid[valid["餐點性質(type)"] == "主食"].to_dict("records")
-        sides = valid[valid["餐點性質(type)"] == "副餐"].to_dict("records")
+    def check_drink_limit(items: List[Dict[str, Any]]) -> bool:
+        return sum(1 for x in items if x.get("is_drink")) <= 1
 
-        main_items = [row_to_item(pd.Series(r)) for r in mains]
-        side_items = [row_to_item(pd.Series(r)) for r in sides]
+    if meal_tag in ["午餐", "晚餐"]:
+        for m in mains:
+            for s in sides:
+                combo = [m, s]
+                if check_drink_limit(combo):
+                    candidates.append(combo)
+        for m in mains:
+            if check_drink_limit([m]):
+                candidates.append([m])
+    else:
+        for m in mains:
+            for s in sides:
+                combo = [m, s]
+                if check_drink_limit(combo):
+                    candidates.append(combo)
+        for m in mains:
+            if check_drink_limit([m]):
+                candidates.append([m])
+        for i in range(len(sides)):
+            for j in range(i + 1, len(sides)):
+                combo = [sides[i], sides[j]]
+                if check_drink_limit(combo):
+                    candidates.append(combo)
+        for s in sides:
+            if check_drink_limit([s]):
+                candidates.append([s])
+    return candidates
 
-        candidates: List[List[MealItem]] = []
 
-        for m in main_items:
-            candidates.append([m])  # 單點主食（預算低時備案）
+def run_simulation(user_profile: Dict[str, Any], df_data: pd.DataFrame) -> tuple[List[Dict[str, Any]], str]:
+    """蒙地卡羅模擬：挑選符合預算/熱量/類別廣度的餐單。"""
+    tdee = calculate_tdee(user_profile)
+    budget = user_profile["budget"]
+    b_min, b_max = budget - CONSTANTS["BUDGET_TOLERANCE"], budget + CONSTANTS["BUDGET_TOLERANCE"]
+    cal_min_ratio, cal_max_ratio = CONSTANTS["CALORIE_RANGE"]
+    min_cal, max_cal = tdee * cal_min_ratio, tdee * cal_max_ratio
 
-        for m in main_items:
-            for s in side_items:
-                candidates.append([m, s])  # 主食 + 副餐
+    pool_b = get_meal_candidates(df_data, "早餐")
+    pool_l = get_meal_candidates(df_data, "午餐")
+    pool_d = get_meal_candidates(df_data, "晚餐")
 
-        if meal_type == "早餐":
-            for s in side_items:
-                candidates.append([s])  # 單點副餐
-            for i in range(len(side_items)):
-                for j in range(i + 1, len(side_items)):
-                    candidates.append([side_items[i], side_items[j]])  # 副餐 + 副餐
+    if not pool_b:
+        return [], "錯誤：資料庫中沒有適合的「早餐」資料。"
+    if not pool_l:
+        return [], "錯誤：資料庫中沒有適合的「午餐主食」。"
+    if not pool_d:
+        return [], "錯誤：資料庫中沒有適合的「晚餐主食」。"
 
-        return candidates
+    valid_plans: List[Dict[str, Any]] = []
+    for _ in range(CONSTANTS["SIMULATION_COUNT"]):
+        mb = random.choice(pool_b)
+        ml = random.choice(pool_l)
+        md = random.choice(pool_d)
+        all_items = mb + ml + md
 
-    @staticmethod
-    def _combo_summary(combo: List[MealItem]) -> Combo:
-        cats = set(cat for item in combo for cat in item["cats"])
-        return {
-            "items": combo,
-            "cal": float(sum(item["cal"] for item in combo)),
-            "price": float(sum(item["price"] for item in combo)),
-            "categories": cats,
-        }
+        names = [x["食物名稱(name)"] for x in all_items]
+        if len(names) != len(set(names)):
+            continue
 
-    def generate_plans(
-        self,
-        user_cal: float,
-        user_budget: float,
-        max_plans: int = 3,
-        simulations: int = DEFAULT_SIMULATIONS,
-    ) -> List[Plan]:
-        pools = {
-            "早餐": self._parse_candidates("早餐"),
-            "午餐": self._parse_candidates("午餐"),
-            "晚餐": self._parse_candidates("晚餐"),
-        }
-        if any(len(pool) == 0 for pool in pools.values()):
-            return []
+        cost = sum(x["價格(price)"] for x in all_items)
+        cal = sum(x["熱量(calories)"] for x in all_items)
+        if not (min_cal <= cal <= max_cal):
+            continue
+        diff = abs(cal - tdee)
 
-        valid_plans: List[Plan] = []
+        # 僅保留超支 100 元以內的組合
+        if cost > budget + CONSTANTS["MAX_BUDGET_OVERRUN"]:
+            continue
 
-        for _ in range(simulations):
-            cb = random.choice(pools["早餐"])
-            cl = random.choice(pools["午餐"])
-            cd = random.choice(pools["晚餐"])
-
-            all_items = cb + cl + cd
-            names = [i["name"] for i in all_items]
-            if len(names) != len(set(names)):
+        status = "Valid"
+        if cost > b_max:
+            if (diff / tdee) < CONSTANTS["CAL_DIFF_WARN_RATIO"]:
+                status = "OverBudgetWarning"  # 超出容忍度也給警示
+            else:
                 continue
+        elif cost > budget:
+            status = "OverBudgetWarning"  # 任何超支都提示
+        # 若低於下限容忍則直接接受，不警示
 
-            total_cost = sum(i["price"] for i in all_items)
-            # 只檢查不超支，允許低於預算（避免資料集價格偏低時無解）
-            if total_cost > user_budget + BUDGET_TOLERANCE:
-                continue
+        cats: Set[str] = set()
+        for x in all_items:
+            cats.update(x["categories_set"])
 
-            total_cal = sum(i["cal"] for i in all_items)
-            cal_diff = abs(total_cal - user_cal)
+        # 需要涵蓋六大食物類別才視為有效方案
+        if not cats.issuperset(FOOD_GROUPS):
+            continue
 
-            cats: Set[str] = set()
-            for item in all_items:
-                cats.update(item["cats"])
-
-            plan_record: Plan = {
-                "menu": [
-                    {"meal": "早餐", **self._combo_summary(cb)},
-                    {"meal": "午餐", **self._combo_summary(cl)},
-                    {"meal": "晚餐", **self._combo_summary(cd)},
-                ],
-                "total_cal": float(total_cal),
-                "total_cost": float(total_cost),
-                "diversity": list(cats),
-                "cat_count": len(cats),
-                "cal_diff": float(cal_diff),
+        valid_plans.append(
+            {
+                "plan_content": {"早餐": mb, "午餐": ml, "晚餐": md},
+                "metrics": {
+                    "cost": cost,
+                    "cal": cal,
+                    "diff": diff,
+                    "cat_count": len(cats),
+                    "categories": list(cats),
+                    "status": status,
+                },
             }
-            valid_plans.append(plan_record)
+        )
 
-        valid_plans.sort(key=lambda x: (-x["cat_count"], x["cal_diff"]))
+    return valid_plans, "Success"
 
-        unique_plans: List[Plan] = []
-        seen: Set[tuple] = set()
-        for p in valid_plans:
-            sig = (int(p["total_cost"]), int(p["total_cal"]))
-            if sig in seen:
-                continue
-            seen.add(sig)
-            unique_plans.append(p)
-            if len(unique_plans) >= max_plans:
-                break
 
-        return unique_plans
+def select_top_plans(valid_plans: List[Dict[str, Any]], num_plans: int = 3) -> tuple[List[Dict[str, Any]], bool]:
+    """依類別廣度與熱量誤差排序，取唯一解。"""
+    if not valid_plans:
+        return [], False
+
+    valid_plans.sort(key=lambda x: (-x["metrics"]["cat_count"], x["metrics"]["diff"]))
+
+    unique: List[Dict[str, Any]] = []
+    seen: Set[tuple] = set()
+    has_warning = False
+
+    for p in valid_plans:
+        sig = (p["metrics"]["cost"], p["metrics"]["cal"])
+        if sig in seen:
+            continue
+        seen.add(sig)
+        unique.append(p)
+        if p["metrics"]["status"] == "OverBudgetWarning":
+            has_warning = True
+        if len(unique) >= num_plans:
+            break
+    return unique, has_warning
 
 
 def budget_level(total_price: float) -> str:
@@ -486,48 +610,49 @@ def budget_level(total_price: float) -> str:
     return "高預算"
 
 
-def budget_cap(budget_type: str) -> float:
-    if budget_type == "低預算":
-        return 499
-    if budget_type == "中預算":
-        return 800
-    return 1200
+def build_plans(user_profile: Dict[str, Any], df_data: pd.DataFrame) -> tuple[List[Plan], str, bool]:
+    """使用最新蒙地卡羅演算法生成最多三套可行方案。"""
+    if df_data.empty:
+        return [], "錯誤：資料庫為空，請確認 711_food_data.csv 是否存在。", False
 
+    valid_plans, status = run_simulation(user_profile, df_data)
+    if status != "Success":
+        return [], status, False
+    if not valid_plans:
+        no_plan_msg = (
+            "⚠️ 搜尋結果：找不到符合條件的組合。\n"
+            "原因可能是：\n"
+            "1. 預算過低 (午晚餐強制主食 + 早餐，建議預算 > 250元)\n"
+            "2. 資料庫食物選擇不足或無法同時涵蓋六大食物類別\n"
+        )
+        return [], no_plan_msg, False
 
-def build_plans(target_calories: float, budget_type: str) -> List[Plan]:
-    """使用核心演算法生成最多三套可行方案（可能少於三套）。"""
-    if FOOD_DF.empty:
-        return []
-
-    optimizer = MenuOptimizer(FOOD_DF)
-    daily_budget = budget_cap(budget_type)
-    raw_plans = optimizer.generate_plans(user_cal=target_calories, user_budget=daily_budget, max_plans=3)
-    if not raw_plans:
-        return []
+    top_plans, has_warning = select_top_plans(valid_plans, num_plans=3)
+    if not top_plans:
+        return [], "⚠️ 搜尋結果：找不到符合條件的組合。", has_warning
 
     tags = [("營養師推薦", "⭐"), ("精省首選", "💰"), ("均衡美味", "👍")]
     plans: List[Plan] = []
-
-    for plan, (tag, icon) in zip(raw_plans, tags):
-        meal_map = {"早餐": [], "午餐": [], "晚餐": []}
-        for meal in plan["menu"]:
-            meal_map[meal["meal"]].extend(meal["items"])
-
-        categories = set(plan.get("diversity", []))
+    for plan_data, (tag, icon) in zip(top_plans, tags):
+        metrics = plan_data["metrics"]
+        meal_map = {k: [record_to_item(item) for item in v] for k, v in plan_data["plan_content"].items()}
+        categories = set(metrics.get("categories", []))
         plans.append(
             {
-                "breakfast": meal_map["早餐"],
-                "lunch": meal_map["午餐"],
-                "dinner": meal_map["晚餐"],
-                "totalCal": int(plan["total_cal"]),
-                "totalPrice": int(plan["total_cost"]),
-                "budgetLevel": budget_level(plan["total_cost"]),
+                "breakfast": meal_map.get("早餐", []),
+                "lunch": meal_map.get("午餐", []),
+                "dinner": meal_map.get("晚餐", []),
+                "totalCal": int(metrics["cal"]),
+                "totalPrice": int(metrics["cost"]),
+                "budgetLevel": budget_level(metrics["cost"]),
                 "missingCategories": [c for c in FOOD_GROUPS if c not in categories],
+                "userBudget": int(user_profile["budget"]),
                 "tag": tag,
                 "tagIcon": icon,
+                "status": metrics.get("status", "Valid"),
             }
         )
-    return plans
+    return plans, "Success", has_warning
 
 
 # ---------------------------------------------------------------------
@@ -548,18 +673,15 @@ def render_hero() -> None:
         <div class="fp-hero">
             <div style="display:flex; align-items:center; justify-content:space-between; gap:24px; flex-wrap:wrap; margin-top:4px;">
                 <div style="max-width:580px; min-width:280px;">
-                    <div class="fp-badge">FitPocket · Earth Tone</div>
-                    <h1 style="margin:12px 0 10px; font-size:32px; font-weight:900; letter-spacing:-0.4px; color: var(--brand-text); line-height:1.2;">
-                        美味、均衡、剛剛好 —— 7-ELEVEN 一日三餐精選
-                    </h1>
-                    <p style="margin:6px 0 0; color: var(--brand-muted); font-size:15px; font-weight:700; line-height:1.6;">
-                        依你的 BMR / TDEE 與預算，秒產最多三套餐單，讓營養與荷包同時兼顧。
+                    <h2 style="margin:0 0 10px; font-size:36px; font-weight:900; color:#1f2937; line-height:1.1; letter-spacing:-0.3px;">
+                        量身打造<br/>
+                        <span style="color:transparent; background:linear-gradient(90deg, #f59e0b, #f97316); -webkit-background-clip:text; background-clip:text;">
+                            您的專屬菜單
+                        </span>
+                    </h2>
+                    <p style="margin:0; color:#6b7280; font-size:16px; font-weight:700; line-height:1.6;">
+                        FitPocket 結合營養科學與美味演算法。輸入您的身體數值，我們將為您計算最精準的熱量需求，並嚴格把關您的餐食預算。
                     </p>
-                    <div style="display:flex; gap:10px; flex-wrap:wrap; margin-top:14px;">
-                        <span class="fp-pill">大地色系介面</span>
-                        <span class="fp-pill">營養師級邏輯</span>
-                        <span class="fp-pill">隨時調整預算</span>
-                    </div>
                 </div>
                 <div class="fp-hero-illo">
                     <div class="fp-floating"></div>
@@ -600,26 +722,33 @@ def render_hero() -> None:
 
 
 
-def render_metric_cards(bmr: float, tdee: float, tier: int, activity_label: str) -> None:
+def render_metric_cards(
+    bmr: float, tdee: float, bmi_value: float, activity_label: str, activity_multiplier: float
+) -> None:
     """Display BMR/TDEE/recommendation summary cards."""
+    bmi_status = bmi_category(bmi_value)
     st.markdown(
         f"""
-        <div class="fp-card" style="margin-top:18px; background:linear-gradient(120deg, rgba(247,241,232,0.7), #fff);">
+        <div class="fp-card" style="margin-top:18px; margin-bottom:26px; background:linear-gradient(120deg, rgba(247,241,232,0.7), #fff);">
             <div style="display:flex; gap:16px; flex-wrap:wrap;">
                 <div class="fp-card" style="flex:1; min-width:220px; background:linear-gradient(150deg, rgba(216,116,76,0.12), #fff);">
                     <div class="fp-pill">BMR</div>
                     <div style="font-size:26px; font-weight:900; margin-top:6px;">{bmr:.0f} kcal / 天</div>
-                    <div style="color:var(--brand-muted); font-weight:700; font-size:12px;">Harris-Benedict 公式估算</div>
+                    <div style="color:var(--brand-muted); font-weight:700; font-size:12px;">BMR 指靜止時維持生命的最低熱量。</div>
                 </div>
                 <div class="fp-card" style="flex:1; min-width:220px; background:linear-gradient(150deg, rgba(110,139,61,0.12), #fff);">
                     <div class="fp-pill">TDEE</div>
                     <div style="font-size:26px; font-weight:900; margin-top:6px;">{tdee:.0f} kcal / 天</div>
-                    <div style="color:var(--brand-muted); font-weight:700; font-size:12px;">活動係數：{activity_label}</div>
+                    <div style="color:var(--brand-muted); font-weight:700; font-size:12px; margin-top:4px; line-height:1.5;">
+                        TDEE 為單日總消耗熱量，含基礎代謝、活動及飲食。\
+                    </div>
+                    <div style="color:var(--brand-muted); font-weight:700; font-size:12px;">
+                        = BMR x {activity_multiplier:.3g} （{activity_label}）
+                    </div>
                 </div>
                 <div class="fp-card" style="flex:1; min-width:220px; background:linear-gradient(150deg, rgba(242,197,124,0.16), #fff);">
-                    <div class="fp-pill">建議目標</div>
-                    <div style="font-size:26px; font-weight:900; margin-top:6px;">{tier} kcal / 天</div>
-                    <div style="color:var(--brand-muted); font-weight:700; font-size:12px;">以熱量級距協助找餐單</div>
+                    <div class="fp-pill">BMI</div>
+                    <div style="font-size:26px; font-weight:900; margin-top:6px;">{bmi_value:.1f} {bmi_status}</div>
                 </div>
             </div>
         </div>
@@ -631,10 +760,9 @@ def render_metric_cards(bmr: float, tdee: float, tier: int, activity_label: str)
 def render_meal_block(title: str, items: List[MealItem]) -> None:
     st.markdown(f"<div class='fp-section-title'>{title}</div>", unsafe_allow_html=True)
     st.caption(
-        f"總熱量 {sum(i['cal'] for i in items)} kcal · 合作通路：7-ELEVEN · 共 {len(items)} 道餐點"
+        f"總熱量 {sum(i['cal'] for i in items)} kcal · 共 {len(items)} 道餐點"
     )
     for item in items:
-        cats = "、".join(item["cats"])
         if item.get("img"):
             img_tag = f"<img src='{item['img']}' alt='{item['name']}' style='width:72px;height:72px;object-fit:cover;border-radius:10px;border:1px solid var(--brand-stroke);background:#fff;' onerror=\"this.style.display='none'\"/>"
         else:
@@ -656,8 +784,6 @@ def render_meal_block(title: str, items: List[MealItem]) -> None:
                         <span>{item['store']}</span>
                         <span>·</span>
                         <span>{item['cal']} kcal</span>
-                        <span>·</span>
-                        <span>{cats}</span>
                     </div>
                     <div style="margin-top:6px; display:flex; flex-wrap:wrap; gap:8px;">
                         {"".join([f"<span class='fp-pill'>{c}</span>" for c in item["cats"]])}
@@ -675,30 +801,95 @@ def render_stat_chip(text: str) -> str:
 
 
 def render_plan_header(plan: Plan, label: str) -> None:
-    """Header bar for each plan tab."""
-    stats_html = "".join(
-        [
-            render_stat_chip(f"總熱量 {plan['totalCal']} kcal"),
-            render_stat_chip(f"總花費 NT${plan['totalPrice']}"),
-            render_stat_chip(f"預算 {plan['budgetLevel']}"),
-        ]
+    """Header bar for each plan tab (只顯示統計區域)，重新美化並合併六大類狀態。"""
+    missing = plan.get("missingCategories", [])
+    if missing:
+        cat_text = f"缺少：{'、'.join(missing)}"
+        cat_class = "warn"
+    else:
+        cat_text = "已涵蓋六大食物類別 ✅"
+        cat_class = "ok"
+
+    budget = int(plan.get("userBudget", 0))
+    cost = int(plan.get("totalPrice", 0))
+    balance = budget - cost
+    if balance >= 0:
+        balance_icon, balance_text = "💡", f"省下 NT${balance}"
+    else:
+        balance_icon, balance_text = "⚠️", f"超支 NT${abs(balance)}"
+
+    metrics = [
+        ("🔥", f"總熱量 {plan['totalCal']} kcal"),
+        ("💰", f"總花費 NT${plan['totalPrice']}"),
+        (balance_icon, balance_text),
+    ]
+    metric_html = "".join(
+        [f"<div class='fp-metric-chip'><span class='icon'>{ico}</span><span>{txt}</span></div>" for ico, txt in metrics]
     )
+
     st.markdown(
         f"""
-        <div style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:12px;">
-            <div style="display:flex; align-items:center; gap:10px;">
-                <div class="fp-logo-icon" style="width:34px; height:34px; box-shadow:none;">
-                    <span style="position:relative; z-index:1; font-size:16px;">{plan['tagIcon']}</span>
-                </div>
-                <div>
-                    <div style="font-weight:900; color:var(--brand-text);">{label}</div>
-                    <div style="color:var(--brand-muted); font-weight:700; font-size:12px;">{plan['tag']} · {plan['budgetLevel']}</div>
-                </div>
-            </div>
-            <div style="display:flex; gap:12px; flex-wrap:wrap;">
-                {stats_html}
-            </div>
+        <div class="fp-plan-bar">
+          <div class="fp-plan-bar__badge fp-plan-bar__badge-{cat_class}">
+            <span class="icon">{'✅' if cat_class == 'ok' else '⚠️'}</span>
+            <span>{cat_text}</span>
+          </div>
+          <div class="fp-plan-bar__metrics">{metric_html}</div>
         </div>
+        <style>
+          .fp-plan-bar {{
+            display: flex;
+            flex-wrap: wrap;
+            align-items: center;
+            gap: 10px;
+            padding: 12px 14px;
+            border-radius: 14px;
+            background: #ffffff;
+            border: 1px solid rgba(47,38,27,0.08);
+            box-shadow: 0 10px 20px rgba(47,38,27,0.06);
+          }}
+          .fp-plan-bar__badge {{
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 8px 12px;
+            border-radius: 12px;
+            font-weight: 800;
+            letter-spacing: 0.2px;
+            border: 1px solid transparent;
+          }}
+          .fp-plan-bar__badge-ok {{
+            background: rgba(110,139,61,0.12);
+            border-color: rgba(110,139,61,0.2);
+            color: var(--brand-secondary);
+          }}
+          .fp-plan-bar__badge-warn {{
+            background: rgba(216,116,76,0.12);
+            border-color: rgba(216,116,76,0.22);
+            color: var(--brand-primary);
+          }}
+          .fp-plan-bar__metrics {{
+            display: flex;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 8px;
+          }}
+          .fp-metric-chip {{
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 8px 12px;
+            border-radius: 12px;
+            background: #f8f5f0;
+            border: 1px solid rgba(47,38,27,0.08);
+            box-shadow: none;
+            font-weight: 800;
+            color: var(--brand-text);
+          }}
+          .fp-metric-chip .icon {{
+            font-size: 14px;
+          }}
+        </style>
         """,
         unsafe_allow_html=True,
     )
@@ -708,9 +899,7 @@ render_hero()
 
 
 with st.form("user_input"):
-    st.markdown('<div class="fp-card">', unsafe_allow_html=True)
     st.markdown('<div class="fp-section-title">你的基礎資料</div>', unsafe_allow_html=True)
-    st.caption("輸入身體資訊與活動量，系統將計算 BMR / TDEE 並生成最多 3 套餐單。")
     col1, col2, col3 = st.columns([1.2, 1.2, 1])
     with col1:
         gender = st.radio("生理性別", ["male", "female"], format_func=lambda v: "男性" if v == "male" else "女性")
@@ -719,15 +908,15 @@ with st.form("user_input"):
         height = st.number_input("身高（公分）", min_value=130, max_value=220, value=170, step=1)
         weight = st.number_input("體重（公斤）", min_value=30.0, max_value=200.0, value=65.0, step=0.5)
     with col3:
-        budget_type = st.radio("預算偏好", ["低預算", "中預算", "高預算"], horizontal=True)
+        budget_value = st.slider("每日預算上限 (NTD)", min_value=200, max_value=1200, value=600, step=10)
         activity = st.selectbox(
             "日常活動量",
             options=[
-                ("sedentary", "久坐 / 辦公室 (×1.2)"),
-                ("light", "輕度活動：每週運動 1-3 天 (×1.375)"),
-                ("moderate", "中度活動：每週運動 3-5 天 (×1.55)"),
-                ("active", "高度活動：每週運動 6-7 天 (×1.725)"),
-                ("very_active", "超高活動：勞力工作或重度訓練 (×1.9)"),
+                ("久坐", "久坐 / 辦公室"),
+                ("輕強度", "輕度活動：每週運動 1-3 天"),
+                ("中強度", "中度活動：每週運動 3-5 天"),
+                ("高強度", "高度活動：每週運動 6-7 天"),
+                ("超高強度", "超高活動：勞力工作或重度訓練"),
             ],
             format_func=lambda t: t[1],
         )
@@ -736,15 +925,28 @@ with st.form("user_input"):
 
 
 if submitted:
+    activity_level, activity_label = activity
+    activity_multiplier = ACTIVITY_MULTIPLIERS.get(activity_level, 1.2)
     bmr = calculate_bmr(gender, age, height, weight)
-    tdee = bmr * get_activity_multiplier(activity[0])
-    tier = get_closest_tier(tdee)
-    plans = build_plans(tier, budget_type)
-    if not plans:
-        st.error("目前無法生成餐單，請確認資料是否完整。")
-        st.stop()
+    tdee = bmr * activity_multiplier
+    bmi_value = weight / ((height / 100) ** 2)
 
-    render_metric_cards(bmr, tdee, tier, activity[1])
+    user_profile = {
+        "age": int(age),
+        "gender": gender,
+        "height": float(height),
+        "weight": float(weight),
+        "activity_level": activity_level,
+        "budget": float(budget_value),
+    }
+
+    plans, status_msg, has_warning = build_plans(user_profile, FOOD_DF)
+
+    render_metric_cards(bmr, tdee, bmi_value, activity_label, activity_multiplier)
+
+    if not plans:
+        st.warning(status_msg)
+        st.stop()
 
     labels = [f"方案{chr(65 + i)}" for i in range(len(plans))]
     tab_titles = labels
@@ -752,16 +954,17 @@ if submitted:
 
     for tab, label, plan in zip(tabs, labels, plans):
         with tab:
-            st.markdown('<div class="fp-card">', unsafe_allow_html=True)
             render_plan_header(plan, label)
 
-            if plan["missingCategories"]:
-                st.warning("缺少的食物類別：" + "、".join(plan["missingCategories"]))
-            else:
-                st.success("已涵蓋六大食物類別 ✅")
+            if plan.get("status") == "OverBudgetWarning":
+                st.warning("為了貼近熱量目標，部分組合略微超出預算上限。")
+            elif plan.get("status") == "CalorieShortfall":
+                st.warning(
+                    "目前無法找到達到目標熱量 90%~110% 的組合，以下為最接近的方案，"
+                    "建議提高預算或放寬熱量條件。"
+                )
 
             st.divider()
-            render_meal_block("早餐", plan["breakfast"])
-            render_meal_block("午餐", plan["lunch"])
-            render_meal_block("晚餐", plan["dinner"])
-            st.markdown("</div>", unsafe_allow_html=True)
+            render_meal_block(MEAL_DISPLAY_NAMES["breakfast"], plan["breakfast"])
+            render_meal_block(MEAL_DISPLAY_NAMES["lunch"], plan["lunch"])
+            render_meal_block(MEAL_DISPLAY_NAMES["dinner"], plan["dinner"])
